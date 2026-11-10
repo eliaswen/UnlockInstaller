@@ -1,0 +1,30 @@
+[package]
+name = "unlockinstaller"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["rar"]
+# rar archive support. Its C++ library cannot be cross-compiled to Windows
+# from another OS, so such builds use `--no-default-features`.
+rar = ["dep:unrar-ng"]
+
+[dependencies]
+bzip2 = "0.6"
+dirs = "7.0.0"
+dunce = "1"
+flate2 = "1"
+gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+lzma-rust2 = "0.25"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sevenz-rust2 = "0.25.0"
+tar = "0.4.46"
+unrar-ng = { version = "0.7.7", optional = true }
+ureq = { version = "2", features = ["json"] }
+walkdir = "2.5.0"
+zip = "9.5.0"
+zstd = "0.14"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
