@@ -1,1 +1,3 @@
 /target
+# Written by cxx-qt for the QML language server; machine-specific.
+/.qmlls.ini

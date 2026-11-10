@@ -3,8 +3,10 @@
 #
 #   cargo build --release && packaging/build-appimage.sh <output.AppImage>
 #
-# Needs: wget, file, patchelf, librsvg2-dev and the GTK4 development files.
-# linuxdeploy and its GTK plugin are downloaded into target/appimage/.
+# Needs: wget, file and patchelf, plus the Qt 6 the app was built against
+# (found through qmake6, or QMAKE). linuxdeploy and its Qt plugin are
+# downloaded into target/appimage/; the plugin copies Qt, its plugins and the
+# QML modules that qml/*.qml imports into the AppImage.
 set -euo pipefail
 
 out=$(realpath -m "$1")
@@ -14,25 +16,24 @@ rm -rf "$work/AppDir"
 mkdir -p "$work"
 cd "$work"
 
-[[ -x linuxdeploy-x86_64.AppImage ]] || {
-    wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-    chmod +x linuxdeploy-x86_64.AppImage
-}
-[[ -x linuxdeploy-plugin-gtk.sh ]] || {
-    wget -q https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
-    chmod +x linuxdeploy-plugin-gtk.sh
-}
+for tool in linuxdeploy linuxdeploy-plugin-qt; do
+    [[ -x $tool-x86_64.AppImage ]] || {
+        wget -q "https://github.com/linuxdeploy/$tool/releases/download/continuous/$tool-x86_64.AppImage"
+        chmod +x "$tool-x86_64.AppImage"
+    }
+done
 
 # No FUSE in CI containers: let the AppImage tools unpack themselves instead.
 export APPIMAGE_EXTRACT_AND_RUN=1
-export DEPLOY_GTK_VERSION=4
 export LDAI_OUTPUT=$out OUTPUT=$out
+export QMAKE=${QMAKE:-$(command -v qmake6 || command -v qmake)}
+export QML_SOURCES_PATHS=$root/qml
 
 ./linuxdeploy-x86_64.AppImage \
     --appdir AppDir \
     --executable "$root/target/release/unlockinstaller" \
     --desktop-file "$root/packaging/io.github.UnlockInstaller.desktop" \
     --icon-file "$root/packaging/io.github.UnlockInstaller.svg" \
-    --plugin gtk \
+    --plugin qt \
     --output appimage
 echo "Wrote $out"

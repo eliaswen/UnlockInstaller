@@ -7,12 +7,17 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
-use walkdir::WalkDir;
+use serde_json::Value;
 
 use crate::binfmt::{self, Arch};
+use crate::paths;
 use crate::unlocker::{self, Installed};
-use crate::vdf::{parse_vdf, Vdf};
+use crate::vdf::{Vdf, parse_vdf};
+
+const ICON_CACHE_TTL: u64 = 30 * 24 * 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Platform {
@@ -51,6 +56,10 @@ impl ApiFile {
 pub struct ExeDir {
     pub dir: PathBuf,
     pub arch: Arch,
+    /// DLLs statically linked (imported or delay-imported) by the
+    /// executables in `dir` and by the game's own DLLs next to them,
+    /// lowercased (`version.dll`), mapped to the file names importing them.
+    pub imports: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +70,70 @@ pub struct Game {
     pub apis: Vec<ApiFile>,
     pub exe_dirs: Vec<ExeDir>,
     pub installed: Vec<Installed>,
+    /// Koaloader proxy the game's binaries are seen to load (see
+    /// [`unlocker::suggest_proxy`]).
+    pub suggested_proxy: Option<unlocker::ProxySuggestion>,
+}
+
+/// Where [`fetch_game_icon`] caches a game's icon.
+pub fn game_icon_path(appid: u32) -> PathBuf {
+    paths::cache_dir()
+        .join("game-icons")
+        .join(format!("{appid}.ico"))
+}
+
+/// Fetch a game's Steam library icon, preferring the local cache.
+pub fn fetch_game_icon(appid: u32) -> Result<Vec<u8>, String> {
+    let path = game_icon_path(appid);
+    let cached = fs::read(&path).ok();
+    if let Some(bytes) = &cached {
+        if let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) {
+            if modified
+                .elapsed()
+                .map(|age| age.as_secs() < ICON_CACHE_TTL)
+                .unwrap_or(false)
+            {
+                return Ok(bytes.clone());
+            }
+        }
+    }
+
+    let clienticon = match ureq::get(&format!("https://api.steamcmd.net/v1/info/{appid}")).call() {
+        Ok(mut response) => {
+            let info: Value = response
+                .body_mut()
+                .read_json()
+                .map_err(|e| format!("could not read Steam icon metadata: {e}"))?;
+            info.get("data")
+                .and_then(|data| data.get(appid.to_string()))
+                .and_then(|app| app.pointer("/common/clienticon"))
+                .and_then(Value::as_str)
+                .filter(|icon| !icon.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("Steam did not provide a client icon for app {appid}"))?
+        }
+        Err(_e) if cached.is_some() => return Ok(cached.unwrap_or_default()),
+        Err(e) => return Err(format!("could not fetch Steam icon metadata: {e}")),
+    };
+    let url = format!(
+        "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/{appid}/{clienticon}.ico"
+    );
+    let bytes = match ureq::get(&url).call() {
+        Ok(mut response) => response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| format!("could not read game icon: {e}"))?,
+        Err(_e) if cached.is_some() => return Ok(cached.unwrap_or_default()),
+        Err(e) => return Err(format!("could not fetch game icon: {e}")),
+    };
+    if bytes.is_empty() {
+        return Err("Steam returned an empty game icon".into());
+    }
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, &bytes);
+    Ok(bytes)
 }
 
 impl Game {
@@ -84,6 +157,7 @@ impl Game {
     }
     pub fn refresh_installed(&mut self) {
         self.installed = unlocker::detect(self);
+        self.suggested_proxy = unlocker::suggest_proxy(self);
     }
 }
 
@@ -96,7 +170,11 @@ fn steam_root_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for (hive, key, value) in [
         (HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
-        (HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\WOW6432Node\Valve\Steam",
+            "InstallPath",
+        ),
         (HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", "InstallPath"),
     ] {
         let path = RegKey::predef(hive)
@@ -183,13 +261,39 @@ pub fn library_folders() -> Vec<PathBuf> {
 /// Executables that are never the game itself.
 fn is_junk_exe(path: &Path) -> bool {
     const NAME: &[&str] = &[
-        "unins", "crash", "redist", "setup", "install", "vc_", "vcredist", "dxwebsetup", "dotnet",
-        "easyanticheat", "battleye", "be_service", "update", "prereq", "cefprocess", "report",
-        "helper", "launcherpatcher", "dxsetup", "oalinst", "physx",
+        "unins",
+        "crash",
+        "redist",
+        "setup",
+        "install",
+        "vc_",
+        "vcredist",
+        "dxwebsetup",
+        "dotnet",
+        "easyanticheat",
+        "battleye",
+        "be_service",
+        "update",
+        "prereq",
+        "cefprocess",
+        "report",
+        "helper",
+        "launcherpatcher",
+        "dxsetup",
+        "oalinst",
+        "physx",
     ];
     const DIR: &[&str] = &[
-        "_commonredist", "redist", "directx", "thirdparty", "easyanticheat", "battleye",
-        "prerequisites", "vcredist", "dotnet", "toolchain",
+        "_commonredist",
+        "redist",
+        "directx",
+        "thirdparty",
+        "easyanticheat",
+        "battleye",
+        "prerequisites",
+        "vcredist",
+        "dotnet",
+        "toolchain",
     ];
     let lower = path.to_string_lossy().to_ascii_lowercase();
     let file = path
@@ -200,23 +304,143 @@ fn is_junk_exe(path: &Path) -> bool {
     NAME.iter().any(|n| file.contains(n)) || DIR.iter().any(|d| parent.contains(d))
 }
 
+/// Number of worker threads for scanning. Directory walks mostly wait on the
+/// disk, so more threads than cores would still help a little, but this keeps
+/// the load reasonable.
+fn scan_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 16)
+}
+
+/// Run `f` over `items` on several threads, keeping the input order.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let threads = scan_threads().min(items.len());
+    let mut out: Vec<(usize, R)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        local.push((i, f(item)));
+                    }
+                    local
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap_or_default()).collect()
+    });
+    out.sort_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Whether a file name (lowercased) is one the scan cares about: a Steamworks
+/// API library, an unlocker's backup of one, or an executable.
+fn is_interesting(lower: &str) -> bool {
+    matches!(
+        lower,
+        "steam_api.dll"
+            | "steam_api64.dll"
+            | "steam_api_o.dll"
+            | "steam_api64_o.dll"
+            | "libsteam_api.so"
+            | "libsteam_api_o.so"
+    ) || lower.ends_with(".exe")
+}
+
+/// Walk several directory trees at once on a pool of threads and return, per
+/// root, the sorted paths of the files [`is_interesting`] accepts. Symlinks
+/// are not followed. All trees share one work queue, so a single huge game
+/// is spread over every thread instead of holding up the scan on one.
+fn find_interesting(roots: &[&Path]) -> Vec<Vec<PathBuf>> {
+    // (pending directories, number of directories being read right now)
+    let queue: Mutex<(Vec<(usize, PathBuf)>, usize)> = Mutex::new((
+        roots.iter().enumerate().map(|(i, r)| (i, r.to_path_buf())).collect(),
+        0,
+    ));
+    let wake = Condvar::new();
+
+    let worker = || {
+        let mut hits: Vec<(usize, PathBuf)> = Vec::new();
+        let mut subdirs: Vec<(usize, PathBuf)> = Vec::new();
+        loop {
+            let (root, dir) = {
+                let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(job) = q.0.pop() {
+                        q.1 += 1;
+                        break job;
+                    }
+                    if q.1 == 0 {
+                        return hits; // nothing queued, nobody can queue more
+                    }
+                    q = wake.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            if let Ok(rd) = fs::read_dir(&dir) {
+                for entry in rd.flatten() {
+                    // file_type() comes from the directory listing: no stat
+                    let Ok(ft) = entry.file_type() else { continue };
+                    if ft.is_dir() {
+                        subdirs.push((root, entry.path()));
+                    } else if ft.is_file() {
+                        let name = entry.file_name();
+                        let lower = name.to_string_lossy().to_ascii_lowercase();
+                        if is_interesting(&lower) {
+                            hits.push((root, entry.path()));
+                        }
+                    }
+                }
+            }
+            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.0.append(&mut subdirs);
+            q.1 -= 1;
+            drop(q);
+            wake.notify_all();
+        }
+    };
+
+    let mut out: Vec<Vec<PathBuf>> = vec![Vec::new(); roots.len()];
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..scan_threads()).map(|_| s.spawn(worker)).collect();
+        for w in workers {
+            for (root, path) in w.join().unwrap_or_default() {
+                out[root].push(path);
+            }
+        }
+    });
+    for v in &mut out {
+        v.sort();
+    }
+    out
+}
+
 /// Walk a game directory once and collect API libraries + executable dirs.
 pub fn inspect_game_dir(dir: &Path) -> (Vec<ApiFile>, Vec<ExeDir>) {
+    let files = find_interesting(&[dir]).pop().unwrap_or_default();
+    inspect_files(dir, &files)
+}
+
+/// Turn the interesting files found in a game directory into its API
+/// libraries and executable dirs.
+fn inspect_files(dir: &Path, files: &[PathBuf]) -> (Vec<ApiFile>, Vec<ExeDir>) {
     // key: (dir, lowercase stem) so `x.dll` + `x_o.dll` dedupe
     let mut apis: BTreeMap<(PathBuf, String), ApiFile> = BTreeMap::new();
     let mut exes: Vec<ExeDir> = Vec::new();
 
-    for entry in WalkDir::new(dir).follow_links(false).into_iter().flatten() {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy();
+    for path in files {
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy()) else { continue };
         let lower = name.to_ascii_lowercase();
-        let parent = entry.path().parent().unwrap_or(dir).to_path_buf();
+        let parent = path.parent().unwrap_or(dir).to_path_buf();
 
         let api = match lower.as_str() {
-            "steam_api.dll" | "steam_api64.dll" => Some((&name[..name.len() - 4], Platform::Windows)),
-            "steam_api_o.dll" | "steam_api64_o.dll" => Some((&name[..name.len() - 6], Platform::Windows)),
+            "steam_api.dll" | "steam_api64.dll" => {
+                Some((&name[..name.len() - 4], Platform::Windows))
+            }
+            "steam_api_o.dll" | "steam_api64_o.dll" => {
+                Some((&name[..name.len() - 6], Platform::Windows))
+            }
             "libsteam_api.so" => Some((&name[..name.len() - 3], Platform::Linux)),
             "libsteam_api_o.so" => Some((&name[..name.len() - 5], Platform::Linux)),
             _ => None,
@@ -233,27 +457,79 @@ pub fn inspect_game_dir(dir: &Path) -> (Vec<ApiFile>, Vec<ExeDir>) {
                 Platform::Windows => Arch::X86,
                 Platform::Linux => {
                     let orig = parent.join(format!("{stem}_o.so"));
-                    let probe = if orig.is_file() { orig } else { entry.path().to_path_buf() };
+                    let probe = if orig.is_file() { orig } else { path.clone() };
                     match binfmt::file_arch(&probe) {
                         Some(a) => a,
                         None => continue,
                     }
                 }
             };
-            apis.insert(key, ApiFile { dir: parent, stem: stem.to_string(), platform, arch });
+            apis.insert(
+                key,
+                ApiFile {
+                    dir: parent,
+                    stem: stem.to_string(),
+                    platform,
+                    arch,
+                },
+            );
             continue;
         }
 
-        if lower.ends_with(".exe") && !is_junk_exe(entry.path()) {
-            if let Some(arch) = binfmt::file_arch(entry.path()) {
-                let e = ExeDir { dir: parent, arch };
-                if !exes.contains(&e) {
-                    exes.push(e);
-                }
+        if lower.ends_with(".exe") && !is_junk_exe(path) {
+            if let Some(arch) = binfmt::file_arch(path) {
+                let i = match exes.iter().position(|e| e.dir == parent && e.arch == arch) {
+                    Some(i) => i,
+                    None => {
+                        exes.push(ExeDir { dir: parent, arch, imports: BTreeMap::new() });
+                        exes.len() - 1
+                    }
+                };
+                add_imports(&mut exes[i].imports, path);
             }
         }
     }
+    for e in &mut exes {
+        add_local_dll_imports(e);
+    }
     (apis.into_values().collect(), exes)
+}
+
+fn add_imports(imports: &mut BTreeMap<String, Vec<String>>, file: &Path) {
+    let Some(names) = binfmt::pe_imports(file) else { return };
+    let who = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    for n in names {
+        let v = imports.entry(n).or_default();
+        if !v.contains(&who) {
+            v.push(who.clone());
+        }
+    }
+}
+
+/// The game's own DLLs next to its executables (e.g. `UnityPlayer.dll`,
+/// often where the real engine lives behind a tiny launcher exe) resolve
+/// their imports from the same folder, so a proxy they import works too.
+/// Unlocker DLLs (Koaloader proxies, SmokeAPI, steam_api) are skipped so an
+/// existing install doesn't influence the result.
+fn add_local_dll_imports(e: &mut ExeDir) {
+    let Ok(rd) = fs::read_dir(&e.dir) else { return };
+    let mut dlls: Vec<PathBuf> = rd
+        .flatten()
+        .map(|d| d.path())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+            let Some(stem) = name.strip_suffix(".dll") else { return false };
+            !stem.starts_with("steam_api")
+                && !stem.starts_with("smokeapi")
+                && !stem.starts_with("smoke_api")
+                && !unlocker::KOALOADER_PROXIES.contains(&stem)
+        })
+        .collect();
+    dlls.sort();
+    for d in dlls {
+        add_imports(&mut e.imports, &d);
+    }
 }
 
 /// Scan every library for installed apps that ship a Steamworks API library.
@@ -262,7 +538,8 @@ pub fn scan_games() -> Result<Vec<Game>, String> {
     if libs.is_empty() {
         return Err("No Steam installation found".into());
     }
-    let mut games: BTreeMap<u32, Game> = BTreeMap::new();
+    // Installed apps from the manifests: (appid, name, install dir).
+    let mut apps: Vec<(u32, String, PathBuf)> = Vec::new();
     for lib in libs {
         let steamapps = lib.join("steamapps");
         let Ok(rd) = fs::read_dir(&steamapps) else {
@@ -280,13 +557,16 @@ pub fn scan_games() -> Result<Vec<Game>, String> {
             let Some(state) = acf.get("AppState") else {
                 continue;
             };
-            let appid = state.get("appid").and_then(Vdf::str).and_then(|s| s.parse().ok());
+            let appid = state
+                .get("appid")
+                .and_then(Vdf::str)
+                .and_then(|s| s.parse().ok());
             let name = state.get("name").and_then(Vdf::str);
             let installdir = state.get("installdir").and_then(Vdf::str);
             let (Some(appid), Some(name), Some(installdir)) = (appid, name, installdir) else {
                 continue;
             };
-            if games.contains_key(&appid) {
+            if apps.iter().any(|a| a.0 == appid) {
                 continue;
             }
             let dir = steamapps.join("common").join(installdir);
@@ -294,24 +574,36 @@ pub fn scan_games() -> Result<Vec<Game>, String> {
             if !dir.is_dir() || dir.join("toolmanifest.vdf").is_file() {
                 continue;
             }
-            let (apis, exe_dirs) = inspect_game_dir(&dir);
-            if apis.is_empty() {
-                continue; // tool / runtime / no Steamworks library
-            }
-            let mut game = Game {
-                appid,
-                name: name.to_string(),
-                dir,
-                apis,
-                exe_dirs,
-                installed: Vec::new(),
-            };
-            game.refresh_installed();
-            games.insert(appid, game);
+            apps.push((appid, name.to_string(), dir));
         }
     }
-    let mut list: Vec<Game> = games.into_values().collect();
-    list.sort_by_key(|g| g.name.to_lowercase());
+
+    // Walk every game directory in one parallel pass, then read the binaries
+    // found in each game on several threads as well.
+    let roots: Vec<&Path> = apps.iter().map(|a| a.2.as_path()).collect();
+    let found = find_interesting(&roots);
+    let jobs: Vec<(&(u32, String, PathBuf), &Vec<PathBuf>)> = apps.iter().zip(&found).collect();
+    let mut list: Vec<Game> = par_map(&jobs, |((appid, name, dir), files)| {
+        let (apis, exe_dirs) = inspect_files(dir, files);
+        if apis.is_empty() {
+            return None; // tool / runtime / no Steamworks library
+        }
+        let mut game = Game {
+            appid: *appid,
+            name: name.clone(),
+            dir: dir.clone(),
+            apis,
+            exe_dirs,
+            installed: Vec::new(),
+            suggested_proxy: None,
+        };
+        game.refresh_installed();
+        Some(game)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    list.sort_by_key(|g| (g.name.to_lowercase(), g.appid));
     Ok(list)
 }
 
@@ -323,7 +615,9 @@ mod tests {
     fn junk_exes() {
         assert!(is_junk_exe(Path::new("/g/_CommonRedist/vcredist_x64.exe")));
         assert!(is_junk_exe(Path::new("/g/UnityCrashHandler64.exe")));
-        assert!(!is_junk_exe(Path::new("/g/Binaries/Win64/Game-Win64-Shipping.exe")));
+        assert!(!is_junk_exe(Path::new(
+            "/g/Binaries/Win64/Game-Win64-Shipping.exe"
+        )));
     }
 
     /// Scans the real Steam install: `cargo test -- --ignored --nocapture`
@@ -341,6 +635,7 @@ mod tests {
                 g.exe_dirs.len(),
                 g.installed
             );
+            println!("    suggested proxy: {:?}", g.suggested_proxy);
         }
     }
 }

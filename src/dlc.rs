@@ -9,9 +9,32 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::paths;
+use crate::steam;
+use crate::vdf::parse_vdf;
 
 /// How long a cached DLC list is considered fresh.
 const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DownloadStatus {
+    Required,
+    Unlikely,
+    NotRequired,
+    AlreadyDone,
+    Unknown,
+}
+
+impl DownloadStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Required => "Download required",
+            Self::Unlikely => "Download unlikely to be required",
+            Self::NotRequired => "Download not required",
+            Self::AlreadyDone => "Download already done",
+            Self::Unknown => "Not enough information",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dlc {
@@ -31,12 +54,27 @@ struct CacheFile {
     dlcs: Vec<Dlc>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct RequirementCache {
+    fetched: u64,
+    status: DownloadStatus,
+}
+
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn cache_path(appid: u32) -> PathBuf {
     paths::cache_dir().join("dlc").join(format!("{appid}.json"))
+}
+
+fn requirement_cache_path(appid: u32, dlc_id: u32) -> PathBuf {
+    paths::cache_dir()
+        .join("dlc-requirements")
+        .join(format!("{appid}-{dlc_id}.json"))
 }
 
 fn selections_path() -> PathBuf {
@@ -80,9 +118,32 @@ fn write_cache(appid: u32, dlcs: &[Dlc]) {
     if let Some(dir) = p.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let file = CacheFile { fetched: now(), dlcs: dlcs.to_vec() };
+    let file = CacheFile {
+        fetched: now(),
+        dlcs: dlcs.to_vec(),
+    };
     if let Ok(json) = serde_json::to_vec(&file) {
         let _ = fs::write(p, json);
+    }
+}
+
+fn read_requirement_cache(appid: u32, dlc_id: u32) -> Option<(u64, DownloadStatus)> {
+    let file: RequirementCache =
+        serde_json::from_slice(&fs::read(requirement_cache_path(appid, dlc_id)).ok()?).ok()?;
+    Some((file.fetched, file.status))
+}
+
+fn write_requirement_cache(appid: u32, dlc_id: u32, status: DownloadStatus) {
+    let path = requirement_cache_path(appid, dlc_id);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let file = RequirementCache {
+        fetched: now(),
+        status,
+    };
+    if let Ok(json) = serde_json::to_vec(&file) {
+        let _ = fs::write(path, json);
     }
 }
 
@@ -107,7 +168,9 @@ pub fn load_dlcs(appid: u32, refresh: bool) -> Result<(Vec<Dlc>, &'static str), 
             },
         },
     };
-    let disabled = read_selections().remove(&appid.to_string()).unwrap_or_default();
+    let disabled = read_selections()
+        .remove(&appid.to_string())
+        .unwrap_or_default();
     for d in &mut dlcs {
         d.enabled = !disabled.contains(&d.id);
     }
@@ -212,7 +275,10 @@ fn resolve_names(agent: &ureq::Agent, ids: &[u32]) -> Vec<(u32, String)> {
                 s.spawn(move || {
                     part.iter()
                         .filter_map(|&id| {
-                            let v = get_json(&agent, &format!("https://api.steamcmd.net/v1/info/{id}"))?;
+                            let v = get_json(
+                                &agent,
+                                &format!("https://api.steamcmd.net/v1/info/{id}"),
+                            )?;
                             let name = v
                                 .get("data")?
                                 .get(id.to_string())?
@@ -232,8 +298,187 @@ fn resolve_names(agent: &ureq::Agent, ids: &[u32]) -> Vec<(u32, String)> {
     })
 }
 
+fn installed_depots() -> BTreeSet<u32> {
+    let mut installed = BTreeSet::new();
+    for library in steam::library_folders() {
+        let steamapps = library.join("steamapps");
+        let Ok(entries) = fs::read_dir(steamapps) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
+                continue;
+            }
+            let Ok(source) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let app = parse_vdf(&source);
+            let Some(depots) = app
+                .get("appstate")
+                .and_then(|state| state.get("installeddepots"))
+            else {
+                continue;
+            };
+            for (id, _) in depots.entries() {
+                if let Ok(id) = id.parse() {
+                    installed.insert(id);
+                }
+            }
+        }
+    }
+    installed
+}
+
+fn requirement_from_info(
+    info: &Value,
+    dlc_id: u32,
+    installed: &BTreeSet<u32>,
+) -> Option<DownloadStatus> {
+    let app = info.get("data")?.as_object()?.values().next()?;
+    let depots = app.get("depots")?.as_object()?;
+    let mut depot_ids = Vec::new();
+    let mut has_size = false;
+    let mut has_download = false;
+    let mut matched = false;
+    for (id, depot) in depots {
+        let Ok(id) = id.parse::<u32>() else { continue };
+        let Some(depot_dlc_id) = depot.get("dlcappid").and_then(as_u32) else {
+            continue;
+        };
+        if depot_dlc_id != dlc_id {
+            continue;
+        }
+        matched = true;
+        depot_ids.push(id);
+        if let Some(manifests) = depot.get("manifests").and_then(Value::as_object) {
+            if let Some(public) = manifests.get("public") {
+                if let Some(size) = public.get("size").and_then(as_u32) {
+                    has_size = true;
+                    has_download |= public
+                        .get("download")
+                        .and_then(as_u32)
+                        .is_some_and(|download| download > 0);
+                    has_download |= size > 0;
+                }
+            }
+        }
+    }
+    if !matched {
+        return Some(DownloadStatus::NotRequired);
+    }
+    if depot_ids.iter().all(|id| installed.contains(id)) {
+        return Some(DownloadStatus::AlreadyDone);
+    }
+    if has_download {
+        Some(DownloadStatus::Required)
+    } else if has_size {
+        Some(DownloadStatus::Unlikely)
+    } else {
+        Some(DownloadStatus::Unknown)
+    }
+}
+
+/// Check whether each DLC appears to add files. This is intentionally
+/// separate from [`load_dlcs`] because it performs one SteamCMD request per
+/// DLC unless a recent local result is available.
+pub fn check_downloads(appid: u32, dlcs: &[Dlc]) -> BTreeMap<u32, DownloadStatus> {
+    let installed = installed_depots();
+    let agent = agent();
+    let mut parent_info = None;
+    let mut parent_info_attempted = false;
+    let mut result = BTreeMap::new();
+    for dlc in dlcs {
+        if let Some((fetched, status)) = read_requirement_cache(appid, dlc.id) {
+            if status != DownloadStatus::Unknown
+                && now().saturating_sub(fetched) < CACHE_TTL.as_secs()
+            {
+                result.insert(dlc.id, status);
+                continue;
+            }
+        }
+        if !parent_info_attempted {
+            parent_info_attempted = true;
+            parent_info = get_json(&agent, &format!("https://api.steamcmd.net/v1/info/{appid}"));
+        }
+        let status = parent_info
+            .as_ref()
+            .and_then(|info| requirement_from_info(info, dlc.id, &installed))
+            .unwrap_or(DownloadStatus::Unknown);
+        write_requirement_cache(appid, dlc.id, status);
+        result.insert(dlc.id, status);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn info(id: u32, depots: Value) -> Value {
+        serde_json::json!({ "data": { id.to_string(): { "depots": depots } } })
+    }
+
+    #[test]
+    fn classifies_dlc_download_status() {
+        assert_eq!(
+            requirement_from_info(&info(1, serde_json::json!({})), 1, &BTreeSet::new()),
+            Some(DownloadStatus::NotRequired)
+        );
+        assert_eq!(
+            requirement_from_info(
+                &info(
+                    1,
+                    serde_json::json!({
+                        "10": { "dlcappid": 1, "manifests": { "public": { "size": 123, "download": 123 } } }
+                    })
+                ),
+                1,
+                &BTreeSet::new()
+            ),
+            Some(DownloadStatus::Required)
+        );
+        assert_eq!(
+            requirement_from_info(
+                &info(
+                    1,
+                    serde_json::json!({
+                        "10": { "dlcappid": 1, "manifests": { "public": { "size": 0, "download": 0 } } }
+                    })
+                ),
+                1,
+                &BTreeSet::new()
+            ),
+            Some(DownloadStatus::Unlikely)
+        );
+        assert_eq!(
+            requirement_from_info(
+                &info(
+                    1,
+                    serde_json::json!({
+                        "10": { "dlcappid": 1, "manifests": { "public": { "size": 123, "download": 123 } } }
+                    })
+                ),
+                1,
+                &BTreeSet::from([10])
+            ),
+            Some(DownloadStatus::AlreadyDone)
+        );
+        assert_eq!(
+            requirement_from_info(
+                &info(
+                    1,
+                    serde_json::json!({
+                        "10": { "dlcappid": 1, "manifests": { "public": {} } }
+                    })
+                ),
+                1,
+                &BTreeSet::new()
+            ),
+            Some(DownloadStatus::Unknown)
+        );
+    }
+
     /// Hits the network: `cargo test -- --ignored`
     #[test]
     #[ignore]

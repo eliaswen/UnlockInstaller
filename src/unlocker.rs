@@ -163,6 +163,68 @@ pub fn koaloader_proxies() -> Vec<String> {
         .collect()
 }
 
+/// A Koaloader proxy the game is known to load, found statically from the
+/// PE import tables of its executables and the DLLs next to them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProxySuggestion {
+    pub proxy: String,
+    /// Files that import the proxy (e.g. `Game.exe`, `UnityPlayer.dll`).
+    pub importers: Vec<String>,
+    /// Whether every executable folder loads it (otherwise only some do).
+    pub everywhere: bool,
+}
+
+/// Whether `dir` holds a `{proxy}.dll` that the game ships (not Koaloader),
+/// which a Koaloader install would have to overwrite.
+fn ships_proxy(dir: &Path, proxy: &str) -> bool {
+    let p = dir.join(format!("{proxy}.dll"));
+    p.is_file() && !fs::read(&p).is_ok_and(|b| binfmt::contains_ci(&b, "koaloader"))
+}
+
+/// Pick the Koaloader proxy most likely to work for `game`: one its binaries
+/// link against, so Windows (or Wine with the DLL override) is guaranteed to
+/// load it at startup. Proxies loaded by the most executable folders win,
+/// then ones an `.exe` imports itself (rather than only a DLL beside it),
+/// then [`KOALOADER_PROXIES`] order.
+/// Proxies the game ships itself are skipped. `None` when no proxy appears in
+/// the import tables: the game may still load one at runtime (`LoadLibrary`),
+/// which can't be seen statically.
+pub fn suggest_proxy(game: &Game) -> Option<ProxySuggestion> {
+    if game.exe_dirs.is_empty() {
+        return None;
+    }
+    KOALOADER_PROXIES
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !game.exe_dirs.iter().any(|d| ships_proxy(&d.dir, p)))
+        .filter_map(|(rank, p)| {
+            let dll = format!("{p}.dll");
+            let mut importers: Vec<String> = Vec::new();
+            let mut dirs = 0;
+            for d in &game.exe_dirs {
+                if let Some(who) = d.imports.get(&dll) {
+                    dirs += 1;
+                    for w in who {
+                        if !importers.contains(w) {
+                            importers.push(w.clone());
+                        }
+                    }
+                }
+            }
+            let by_exe = importers.iter().any(|w| w.to_ascii_lowercase().ends_with(".exe"));
+            (dirs > 0).then(|| {
+                let s = ProxySuggestion {
+                    proxy: p.to_string(),
+                    importers,
+                    everywhere: dirs == game.exe_dirs.len(),
+                };
+                (dirs, by_exe, std::cmp::Reverse(rank), s)
+            })
+        })
+        .max_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)))
+        .map(|t| t.3)
+}
+
 /// Whether Koaloader installs need Steam launch options to work. Wine
 /// prefers its builtin system DLLs unless told otherwise; real Windows
 /// loads the proxy DLL next to the executable on its own.
@@ -608,6 +670,7 @@ mod tests {
             apis,
             exe_dirs,
             installed: vec![],
+            suggested_proxy: None,
         };
         g.refresh_installed();
         g
@@ -670,6 +733,41 @@ mod tests {
         assert!(!game_dir.join("version.dll").exists());
         assert!(!game_dir.join("SmokeAPI64.dll").exists());
         assert!(game_dir.join("steam_api64.dll").exists());
+        fs::remove_dir_all(&game_dir).unwrap();
+    }
+
+    #[test]
+    fn suggests_imported_proxy() {
+        use crate::binfmt::tests::fake_pe_with_imports;
+        let game_dir = tmp("suggest");
+        fs::write(game_dir.join("steam_api64.dll"), b"original").unwrap();
+        fs::write(
+            game_dir.join("Game.exe"),
+            fake_pe_with_imports(&["KERNEL32.dll", "dinput8.dll"], &["XINPUT9_1_0.dll"]),
+        )
+        .unwrap();
+        // an engine DLL next to the exe pulls in winmm too
+        fs::write(game_dir.join("Engine.dll"), fake_pe_with_imports(&["WINMM.dll"], &[])).unwrap();
+
+        let g = game_at(&game_dir);
+        let imports = &g.exe_dirs[0].imports;
+        assert_eq!(imports["winmm.dll"], ["Engine.dll"]);
+        assert_eq!(imports["xinput9_1_0.dll"], ["Game.exe"]);
+        // winmm ranks above dinput8 in KOALOADER_PROXIES, but the exe
+        // importing dinput8 itself counts for more
+        let s = suggest_proxy(&g).unwrap();
+        assert_eq!(s.proxy, "dinput8");
+        assert_eq!(s.importers, ["Game.exe"]);
+        assert!(s.everywhere);
+
+        // a dinput8.dll shipped by the game rules it out
+        fs::write(game_dir.join("dinput8.dll"), b"game's own").unwrap();
+        let s = suggest_proxy(&game_at(&game_dir)).unwrap();
+        assert_eq!(s.proxy, "xinput9_1_0");
+        fs::write(game_dir.join("xinput9_1_0.dll"), b"game's own").unwrap();
+        let s = suggest_proxy(&game_at(&game_dir)).unwrap();
+        assert_eq!(s.proxy, "winmm");
+        assert_eq!(s.importers, ["Engine.dll"]);
         fs::remove_dir_all(&game_dir).unwrap();
     }
 

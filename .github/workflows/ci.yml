@@ -16,6 +16,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Qt for the Ubuntu jobs: headers and build tools, plus the QML modules the
+  # app imports (needed to run it, and by the AppImage's Qt plugin).
+  QT_APT_PACKAGES: >-
+    qt6-base-dev qt6-declarative-dev qt6-declarative-dev-tools
+    qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-templates
+    qml6-module-qtquick-layouts qml6-module-qtquick-dialogs qml6-module-qtquick-window
+    qml6-module-qtqml-workerscript
 
 jobs:
   test:
@@ -51,16 +58,16 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Releasing $version"
 
-      - name: Install GTK
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
+      - name: Install Qt
+        run: sudo apt-get update && sudo apt-get install -y $QT_APT_PACKAGES
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Run the tests
         run: cargo test --locked
 
-  # Debian/Ubuntu package and AppImage. Built on Ubuntu 24.04, the oldest
-  # release with a new enough GTK (4.12), so they also run on anything newer.
+  # Debian/Ubuntu package and AppImage. Built on Ubuntu 24.04 (glibc 2.39), so
+  # they also run on anything newer.
   linux:
     name: Build .deb and AppImage
     needs: test
@@ -74,7 +81,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev librsvg2-dev patchelf file wget
+          sudo apt-get install -y $QT_APT_PACKAGES patchelf file wget
 
       - uses: Swatinem/rust-cache@v2
 
@@ -108,7 +115,7 @@ jobs:
       VERSION: ${{ needs.test.outputs.version }}
     steps:
       - name: Install build dependencies
-        run: dnf install -y git cargo gcc gcc-c++ gtk4-devel
+        run: dnf install -y git cargo gcc gcc-c++ qt6-qtbase-devel qt6-qtdeclarative-devel
 
       - uses: actions/checkout@v4
 
@@ -127,10 +134,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Windows build, cross-compiled with MinGW and zipped with the GTK runtime.
+  # Windows build, cross-compiled with MinGW and zipped with the Qt runtime.
   # Cross-compiled builds have no rar support (see the README).
-  # Fedora 44 because the bundled GTK comes from its MinGW packages (4.21);
-  # that is the combination the bundle was tested with.
   windows:
     name: Build Windows .zip
     needs: test
@@ -139,22 +144,22 @@ jobs:
     container: fedora:44
     env:
       VERSION: ${{ needs.test.outputs.version }}
-      PKG_CONFIG: x86_64-w64-mingw32-pkg-config
-      PKG_CONFIG_ALLOW_CROSS: "1"
+      QMAKE: /usr/bin/x86_64-w64-mingw32-qmake-qt6
+      # The host rcc compresses with zstd, which the MinGW Qt cannot read.
+      CXX_QT_AUTORCC_OPTIONS: --no-zstd
     steps:
       - name: Install build dependencies
         run: >
           dnf install -y git cargo rust-std-static-x86_64-pc-windows-gnu
-          mingw64-gcc mingw64-gtk4 mingw64-librsvg2
-          mingw64-adwaita-icon-theme mingw64-hicolor-icon-theme
-          glib2-devel zip findutils gawk
+          mingw64-gcc-c++ mingw64-qt6-qtbase mingw64-qt6-qtdeclarative
+          binutils findutils zip
 
       - uses: actions/checkout@v4
 
       - name: Build
         run: cargo build --release --locked --no-default-features --target x86_64-pc-windows-gnu
 
-      - name: Bundle with the GTK runtime
+      - name: Bundle with the Qt runtime
         run: |
           mkdir dist
           packaging/windows-bundle.sh \

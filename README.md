@@ -1,7 +1,7 @@
 # UnlockInstaller
 
 A desktop app for Windows and Linux that installs the SmokeAPI or CreamAPI DLC unlockers into Steam games.
-It is written in Rust with GTK4 ([gtk4-rs](https://gtk-rs.org)).
+It is written in Rust with a Qt 6 / QML interface, using [CXX-Qt](https://github.com/KDAB/cxx-qt).
 
 - On **Windows** it handles the games in your Steam libraries.
 - On **Linux** it handles both Windows games run through Proton and native Linux games.
@@ -47,27 +47,34 @@ anything by itself. The check can be turned off in **Settings**, and run by hand
 cargo run --release
 ```
 
-GTK4 must be installed first:
+Qt 6 (6.4 or newer) with Qt Quick must be installed first. The build finds it through `qmake6` (or `qmake`) on `PATH`,
+or the `QMAKE` environment variable.
 
-- **Linux**: the GTK4 development package (`sudo dnf install gtk4-devel` on Fedora, `libgtk-4-dev` on Debian/Ubuntu).
-- **Windows**: follow the [gtk-rs Windows instructions](https://gtk-rs.org/gtk4-rs/stable/latest/book/installation_windows.html).
-  The simplest route is MSYS2 with the `x86_64-pc-windows-gnu` Rust toolchain:
-  `pacman -S mingw-w64-x86_64-gtk4 mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf`.
-  To run the built `.exe` outside the MSYS2 shell, the GTK DLLs (`C:\msys64\mingw64\bin`) must be on `PATH` or copied next to it.
+- **Fedora**: `sudo dnf install gcc-c++ qt6-qtbase-devel qt6-qtdeclarative-devel`
+- **Debian/Ubuntu**: `sudo apt install g++ qt6-base-dev qt6-declarative-dev qt6-declarative-dev-tools qml6-module-qtquick
+  qml6-module-qtquick-controls qml6-module-qtquick-templates qml6-module-qtquick-layouts qml6-module-qtquick-dialogs
+  qml6-module-qtquick-window qml6-module-qtqml-workerscript`
+- **Windows**: install Qt 6 for MinGW with the [Qt online installer](https://www.qt.io/download-qt-installer), use the
+  `x86_64-pc-windows-gnu` Rust toolchain and point `QMAKE` at that Qt's `bin\qmake6.exe`. To run the built `.exe`, run
+  `windeployqt --qmldir qml unlockinstaller.exe` on it once.
+
+The windows are described in `qml/` and compiled into the binary; `src/ui.rs` holds the state behind them.
+The controls use Qt's Fusion style (set `QT_QUICK_CONTROLS_STYLE` to use another one).
 
 ### Cross-compiling for Windows from Linux
 
 On Fedora:
 
 ```sh
-sudo dnf install mingw64-gcc mingw64-gtk4
+sudo dnf install mingw64-gcc-c++ mingw64-qt6-qtbase mingw64-qt6-qtdeclarative
 rustup target add x86_64-pc-windows-gnu
-PKG_CONFIG=x86_64-w64-mingw32-pkg-config PKG_CONFIG_ALLOW_CROSS=1 \
+QMAKE=/usr/bin/x86_64-w64-mingw32-qmake-qt6 CXX_QT_AUTORCC_OPTIONS=--no-zstd \
   cargo build --release --no-default-features --target x86_64-pc-windows-gnu
+packaging/windows-bundle.sh target/x86_64-pc-windows-gnu/release/unlockinstaller.exe UnlockInstaller-windows.zip
 ```
 
-The result is `target/x86_64-pc-windows-gnu/release/unlockinstaller.exe`. To run it on Windows it needs the GTK DLLs
-from `/usr/x86_64-w64-mingw32/sys-root/mingw/bin` next to it.
+The result is `target/x86_64-pc-windows-gnu/release/unlockinstaller.exe`. `packaging/windows-bundle.sh` zips it with
+the Qt DLLs, plugins and QML modules it needs.
 
 `--no-default-features` turns off the `rar` feature: the build script of the RAR library decides what to compile from the
 *host* OS, so it cannot be cross-compiled. A cross-compiled build therefore reads zip, 7z and tar archives but not rar.
@@ -76,14 +83,15 @@ Builds made on Windows itself keep rar support.
 The Windows tests can be run under Wine (use a throwaway prefix; the settings test writes to the registry):
 
 ```sh
-WINEPREFIX=/tmp/ui-wine WINEPATH=/usr/x86_64-w64-mingw32/sys-root/mingw/bin EXPECT_WINE=1 \
-  PKG_CONFIG=x86_64-w64-mingw32-pkg-config PKG_CONFIG_ALLOW_CROSS=1 \
-  CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine \
+WINEPREFIX=/tmp/ui-wine EXPECT_WINE=1 WINEPATH=/usr/x86_64-w64-mingw32/sys-root/mingw/bin \
+  QMAKE=/usr/bin/x86_64-w64-mingw32-qmake-qt6 CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine \
   cargo test --no-default-features --target x86_64-pc-windows-gnu
 ```
 
 Wine is only for running those tests. The app itself should not be used under Wine or Proton: the Windows build shows a
-warning when it detects them, because the native Linux build is the one that handles Proton games.
+warning when it detects them, because the native Linux build is the one that handles Proton games. To make sure that
+warning is readable, under Wine the app draws in software (`QT_QUICK_BACKEND=software`) and uses the Noto Sans font
+bundled in `assets/fonts/`.
 
 ## Features
 

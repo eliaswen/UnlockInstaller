@@ -1,6 +1,6 @@
 [package]
 name = "unlockinstaller"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Installs SmokeAPI and CreamAPI DLC unlockers into Steam games"
 authors = ["Elias Wendland <193786789+eliaswen@users.noreply.github.com>"]
@@ -18,20 +18,25 @@ bzip2 = "0.6"
 dirs = "7.0.0"
 dunce = "1"
 flate2 = "1"
-gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+cxx = "1"
+cxx-qt = "0.10"
+cxx-qt-lib = { version = "0.10", features = ["qt_gui", "qt_qml"] }
 lzma-rust2 = "0.25"
+memchr = "2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sevenz-rust2 = "0.25.0"
 tar = "0.4.46"
 unrar-ng = { version = "0.7.7", optional = true }
 ureq = { version = "3.5.1", features = ["json"] }
-walkdir = "2.5.0"
 zip = "9.5.0"
 zstd = "0.14"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+
+[build-dependencies]
+cxx-qt-build = "0.10"
 
 [profile.release]
 strip = true
@@ -42,7 +47,8 @@ strip = true
 [package.metadata.deb]
 section = "games"
 priority = "optional"
-depends = "$auto"
+# $auto finds the Qt libraries; the QML modules are plugins it cannot see.
+depends = "$auto, qml6-module-qtquick, qml6-module-qtquick-controls, qml6-module-qtquick-templates, qml6-module-qtquick-layouts, qml6-module-qtquick-dialogs, qml6-module-qtquick-window, qml6-module-qtqml-workerscript, qt6-qpa-plugins"
 extended-description = """\
 Scans your Steam libraries, fetches each game's DLC list and installs or \
 removes the SmokeAPI and CreamAPI unlockers. Handles Windows games run \
@@ -57,10 +63,9 @@ assets = [
 [package.metadata.generate-rpm]
 # The project has no license yet; replace this once one is chosen.
 license = "LicenseRef-Not-Specified"
-# The built-in dependency scan lists every library GTK itself pulls in, which
-# breaks whenever one of those changes; depending on GTK is enough.
-auto-req = "no"
-requires = { gtk4 = ">= 4.12", "libstdc++" = "*" }
+# The Qt libraries are found automatically; the QML modules are plugins
+# that the scan cannot see.
+requires = { qt6-qtdeclarative = "*", "libstdc++" = "*" }
 assets = [
     { source = "target/release/unlockinstaller", dest = "/usr/bin/unlockinstaller", mode = "755" },
     { source = "packaging/io.github.UnlockInstaller.desktop", dest = "/usr/share/applications/io.github.UnlockInstaller.desktop", mode = "644" },
