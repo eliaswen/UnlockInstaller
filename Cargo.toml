@@ -63,9 +63,12 @@ assets = [
 [package.metadata.generate-rpm]
 # The project has no license yet; replace this once one is chosen.
 license = "LicenseRef-Not-Specified"
-# The Qt libraries are found automatically; the QML modules are plugins
-# that the scan cannot see.
-requires = { qt6-qtdeclarative = "*", "libstdc++" = "*" }
+# The built-in dependency scan follows Qt's own dependencies down to private
+# libraries no package provides (e.g. libproxy's libpxbackend-1.0.so), which
+# makes the package uninstallable. Depending on the Qt packages is enough;
+# qt6-qtdeclarative also brings the QML modules, which no scan can see.
+auto-req = "no"
+requires = { qt6-qtbase-gui = ">= 6.4", qt6-qtdeclarative = ">= 6.4", "libstdc++" = "*" }
 assets = [
     { source = "target/release/unlockinstaller", dest = "/usr/bin/unlockinstaller", mode = "755" },
     { source = "packaging/io.github.UnlockInstaller.desktop", dest = "/usr/share/applications/io.github.UnlockInstaller.desktop", mode = "644" },
