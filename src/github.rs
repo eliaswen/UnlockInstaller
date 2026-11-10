@@ -1,7 +1,6 @@
 //! Downloads unlocker releases from their official GitHub repositories.
 
 use std::fs;
-use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,11 +38,12 @@ pub struct Release {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(60))
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_recv_body(Some(Duration::from_secs(60)))
         .user_agent(paths::APP_NAME)
         .build()
+        .into()
 }
 
 /// Pick the release archive among a release's assets: archives only,
@@ -69,15 +69,16 @@ pub fn latest_release(repo: &str) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let json: Value = agent()
         .get(&url)
-        .set("Accept", "application/vnd.github+json")
+        .header("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| match e {
-            ureq::Error::Status(403 | 429, _) => {
+            ureq::Error::StatusCode(403 | 429) => {
                 "GitHub API rate limit reached; try again later".to_string()
             }
             e => format!("Cannot reach GitHub: {e}"),
         })?
-        .into_json()
+        .body_mut()
+        .read_json()
         .map_err(|e| format!("Bad response from GitHub: {e}"))?;
     let tag = json["tag_name"].as_str().unwrap_or("latest").to_string();
     let assets: Vec<Asset> = json["assets"]
@@ -124,16 +125,23 @@ fn is_newer(latest: &str, current: &str) -> bool {
 /// is newer than the running one. Nothing is downloaded.
 pub fn check_update() -> Result<Option<String>, String> {
     let url = format!("https://api.github.com/repos/{APP_REPO}/releases/latest");
-    let resp = match agent().get(&url).set("Accept", "application/vnd.github+json").call() {
+    let mut resp = match agent()
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+    {
         Ok(r) => r,
         // no release has been published yet
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(ureq::Error::Status(403 | 429, _)) => {
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        Err(ureq::Error::StatusCode(403 | 429)) => {
             return Err("GitHub API rate limit reached; try again later".into());
         }
         Err(e) => return Err(format!("Cannot reach GitHub: {e}")),
     };
-    let json: Value = resp.into_json().map_err(|e| format!("Bad response from GitHub: {e}"))?;
+    let json: Value = resp
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("Bad response from GitHub: {e}"))?;
     let tag = json["tag_name"].as_str().unwrap_or_default();
     let version = tag.trim().trim_start_matches(['v', 'V']);
     Ok(is_newer(version, env!("CARGO_PKG_VERSION")).then(|| version.to_string()))
@@ -148,10 +156,11 @@ pub fn download_latest(k: Kind) -> Result<(String, PathBuf), String> {
         .get(&release.asset.url)
         .call()
         .map_err(|e| format!("Download failed: {e}"))?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(MAX_ASSET_BYTES + 1)
-        .read_to_end(&mut bytes)
+    let bytes = resp
+        .into_body()
+        .with_config()
+        .limit(MAX_ASSET_BYTES + 1)
+        .read_to_vec()
         .map_err(|e| format!("Download failed: {e}"))?;
     if bytes.len() as u64 > MAX_ASSET_BYTES {
         return Err("Release asset is unexpectedly large; refusing to download".into());

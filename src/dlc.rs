@@ -115,14 +115,15 @@ pub fn load_dlcs(appid: u32, refresh: bool) -> Result<(Vec<Dlc>, &'static str), 
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(20))
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
         .user_agent(paths::APP_NAME)
         .build()
+        .into()
 }
 
 fn get_json(agent: &ureq::Agent, url: &str) -> Option<Value> {
-    agent.get(url).call().ok()?.into_json().ok()
+    agent.get(url).call().ok()?.body_mut().read_json().ok()
 }
 
 fn as_u32(v: &Value) -> Option<u32> {
