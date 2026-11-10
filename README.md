@@ -15,6 +15,32 @@ It is written in Rust with GTK4 ([gtk4-rs](https://gtk-rs.org)).
 Supported archive formats are zip, 7z, rar and tar (plain, `.gz`, `.bz2`, `.xz`, `.zst`). The format is detected from the file's contents, not its extension.
 zip, 7z and rar archives may be password-protected. A few common passwords are tried first, and if they fail you are asked.
 
+## Install
+
+Download the latest version from the [releases page](https://github.com/eliaswen/UnlockInstaller/releases/latest):
+
+- **Windows**: `UnlockInstaller-x.y.z-windows-x86_64.zip`. Unzip it anywhere and run `unlockinstaller.exe`.
+  This build cannot read rar archives.
+- **Linux, any distribution**: `UnlockInstaller-x.y.z-x86_64.AppImage`. Make it executable and run it. Needs glibc 2.39 or newer.
+- **Fedora**: the `.rpm`, or add the dnf repository to also get updates:
+
+  ```sh
+  sudo curl -fsSLo /etc/yum.repos.d/unlockinstaller.repo https://eliaswen.github.io/UnlockInstaller/rpm/unlockinstaller.repo
+  sudo dnf install unlockinstaller
+  ```
+
+- **Debian 13+ / Ubuntu 24.04+**: the `.deb`, or add the apt repository to also get updates:
+
+  ```sh
+  sudo curl -fsSLo /usr/share/keyrings/unlockinstaller.gpg https://eliaswen.github.io/UnlockInstaller/key.gpg
+  echo "deb [signed-by=/usr/share/keyrings/unlockinstaller.gpg] https://eliaswen.github.io/UnlockInstaller/apt ./" | sudo tee /etc/apt/sources.list.d/unlockinstaller.list
+  sudo apt update
+  sudo apt install unlockinstaller
+  ```
+
+The app checks GitHub for a newer release when it starts and shows a link to it; it never downloads or installs
+anything by itself. The check can be turned off in **Settings**, and run by hand from the main menu.
+
 ## Build & run
 
 ```sh
@@ -115,6 +141,36 @@ cargo test                            # unit tests
 # point the data/cache dirs somewhere disposable so your own imported files are untouched:
 XDG_DATA_HOME=/tmp/ui-data XDG_CACHE_HOME=/tmp/ui-cache cargo test -- --ignored --nocapture --test-threads=1
 ```
+
+## Releasing
+
+Releases are made by [.github/workflows/ci.yml](.github/workflows/ci.yml). To publish version `x.y.z`:
+
+1. Set `version = "x.y.z"` in `Cargo.toml` and run `cargo build` so `Cargo.lock` follows.
+2. Commit with the message `Release x.y.z` (exactly that as the first line) and push to `main`.
+
+The workflow then runs the tests, builds the Windows `.zip`, the `.rpm`, the `.deb` and the AppImage, and creates the
+GitHub release `vx.y.z` with those four files and the list of commits since the previous release. Finally it rebuilds
+the dnf and apt repositories from the packages of the five most recent releases and publishes them to GitHub Pages.
+If the version in the commit message and in `Cargo.toml` differ, the run fails before building anything.
+
+One-time setup for the dnf and apt repositories:
+
+1. In the GitHub repository, **Settings → Pages → Build and deployment → Source**: choose **GitHub Actions**.
+2. Create a signing key without a passphrase and store its private half as the `REPO_GPG_PRIVATE_KEY` repository secret
+   (**Settings → Secrets and variables → Actions**):
+
+   ```sh
+   gpg --batch --passphrase '' --quick-generate-key "UnlockInstaller packages" ed25519 sign never
+   gpg --armor --export-secret-keys "UnlockInstaller packages" | gh secret set REPO_GPG_PRIVATE_KEY
+   ```
+
+   Keep a backup of that key: users of the repositories trust it, so replacing it means they must re-add the repository.
+
+Without those two steps the release itself still works; only the last job (the repositories) fails.
+
+The pieces can be run by hand too: `packaging/windows-bundle.sh` (Windows zip), `packaging/build-appimage.sh`
+(AppImage), `cargo deb`, `cargo generate-rpm` and `packaging/build-repos.sh` (repositories).
 
 ## Not yet implemented
 

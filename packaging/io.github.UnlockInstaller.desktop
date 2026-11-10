@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=UnlockInstaller
+Comment=Install SmokeAPI and CreamAPI DLC unlockers into Steam games
+Exec=unlockinstaller
+Icon=io.github.UnlockInstaller
+Terminal=false
+Categories=Game;Utility;
+Keywords=Steam;DLC;SmokeAPI;CreamAPI;
+StartupNotify=true

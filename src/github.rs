@@ -11,6 +11,9 @@ use crate::archive;
 use crate::paths;
 use crate::unlocker::Kind;
 
+/// This application's own repository, used to check for updates.
+pub const APP_REPO: &str = "eliaswen/UnlockInstaller";
+
 /// Largest asset we are willing to download.
 const MAX_ASSET_BYTES: u64 = 200 * 1024 * 1024;
 
@@ -98,6 +101,44 @@ pub fn latest_release(repo: &str) -> Result<Release, String> {
     Ok(Release { tag, asset })
 }
 
+/// Where a user can get the newest release of this application.
+pub fn app_release_url() -> String {
+    format!("https://github.com/{APP_REPO}/releases/latest")
+}
+
+/// Numeric parts of a version such as `1.2.3` or `v1.2.3`.
+fn parse_version(s: &str) -> Option<Vec<u64>> {
+    let s = s.trim();
+    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    s.split('.').map(|p| p.parse().ok()).collect()
+}
+
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+/// The version of the newest published release of this application, if it
+/// is newer than the running one. Nothing is downloaded.
+pub fn check_update() -> Result<Option<String>, String> {
+    let url = format!("https://api.github.com/repos/{APP_REPO}/releases/latest");
+    let resp = match agent().get(&url).set("Accept", "application/vnd.github+json").call() {
+        Ok(r) => r,
+        // no release has been published yet
+        Err(ureq::Error::Status(404, _)) => return Ok(None),
+        Err(ureq::Error::Status(403 | 429, _)) => {
+            return Err("GitHub API rate limit reached; try again later".into());
+        }
+        Err(e) => return Err(format!("Cannot reach GitHub: {e}")),
+    };
+    let json: Value = resp.into_json().map_err(|e| format!("Bad response from GitHub: {e}"))?;
+    let tag = json["tag_name"].as_str().unwrap_or_default();
+    let version = tag.trim().trim_start_matches(['v', 'V']);
+    Ok(is_newer(version, env!("CARGO_PKG_VERSION")).then(|| version.to_string()))
+}
+
 /// Download the latest release archive of `k` into the cache directory.
 /// Returns the release tag and the downloaded file's path.
 pub fn download_latest(k: Kind) -> Result<(String, PathBuf), String> {
@@ -146,6 +187,23 @@ mod tests {
         let assets = [a("koaloader.tar.gz"), a("readme.md")];
         assert_eq!(pick_asset("Koaloader", &assets).unwrap().name, "koaloader.tar.gz");
         assert!(pick_asset("SmokeAPI", &[a("readme.md")]).is_none());
+    }
+
+    #[test]
+    fn compares_versions() {
+        assert!(is_newer("0.2.0", "0.1.9"));
+        assert!(is_newer("v1.0.0", "0.9.12"));
+        assert!(is_newer("0.10.0", "0.9.0"));
+        assert!(!is_newer("0.1.0", "0.1.0"));
+        assert!(!is_newer("0.1.0", "0.2.0"));
+        assert!(!is_newer("nightly", "0.1.0"));
+    }
+
+    /// Hits the network: `cargo test -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn update_check_reaches_github() {
+        println!("update: {:?}", check_update().unwrap());
     }
 
     /// Hits the network: `cargo test -- --ignored --nocapture`

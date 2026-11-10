@@ -2,6 +2,10 @@
 name = "unlockinstaller"
 version = "0.1.0"
 edition = "2024"
+description = "Installs SmokeAPI and CreamAPI DLC unlockers into Steam games"
+authors = ["Elias Wendland <193786789+eliaswen@users.noreply.github.com>"]
+repository = "https://github.com/eliaswen/UnlockInstaller"
+readme = "README.md"
 
 [features]
 default = ["rar"]
@@ -28,3 +32,37 @@ zstd = "0.14"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+
+[profile.release]
+strip = true
+
+# --- Linux packages (built by .github/workflows/ci.yml) ---------------------
+
+# cargo deb
+[package.metadata.deb]
+section = "games"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+Scans your Steam libraries, fetches each game's DLC list and installs or \
+removes the SmokeAPI and CreamAPI unlockers. Handles Windows games run \
+through Proton as well as native Linux games."""
+assets = [
+    ["target/release/unlockinstaller", "usr/bin/", "755"],
+    ["packaging/io.github.UnlockInstaller.desktop", "usr/share/applications/", "644"],
+    ["packaging/io.github.UnlockInstaller.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+]
+
+# cargo generate-rpm
+[package.metadata.generate-rpm]
+# The project has no license yet; replace this once one is chosen.
+license = "LicenseRef-Not-Specified"
+# The built-in dependency scan lists every library GTK itself pulls in, which
+# breaks whenever one of those changes; depending on GTK is enough.
+auto-req = "no"
+requires = { gtk4 = ">= 4.12", "libstdc++" = "*" }
+assets = [
+    { source = "target/release/unlockinstaller", dest = "/usr/bin/unlockinstaller", mode = "755" },
+    { source = "packaging/io.github.UnlockInstaller.desktop", dest = "/usr/share/applications/io.github.UnlockInstaller.desktop", mode = "644" },
+    { source = "packaging/io.github.UnlockInstaller.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.UnlockInstaller.svg", mode = "644" },
+]

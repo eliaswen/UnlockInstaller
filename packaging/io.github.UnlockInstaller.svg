@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="#1b2838"/>
+  <!-- open shackle -->
+  <path d="M92 116 V84 a36 36 0 0 1 72 0 v8" fill="none" stroke="#c7d5e0" stroke-width="18" stroke-linecap="round"/>
+  <!-- body -->
+  <rect x="68" y="112" width="120" height="96" rx="18" fill="#66c0f4"/>
+  <!-- keyhole -->
+  <circle cx="128" cy="150" r="13" fill="#1b2838"/>
+  <rect x="121" y="154" width="14" height="30" rx="5" fill="#1b2838"/>
+</svg>

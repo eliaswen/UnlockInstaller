@@ -1,0 +1,277 @@
+name: CI
+
+# Every push and pull request runs the tests.
+#
+# A push to main whose commit message is "Release x.y.z" (matching the version
+# in Cargo.toml) additionally builds the packages, creates the GitHub release
+# "vx.y.z" and publishes the dnf and apt repositories to GitHub Pages.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    outputs:
+      # Empty unless this push is a release.
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect a release commit
+        id: release
+        if: github.event_name == 'push'
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          subject=$(printf '%s\n' "$MESSAGE" | head -n 1)
+          if [[ ! $subject =~ ^Release\ ([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Not a release commit."
+            exit 0
+          fi
+          version=${BASH_REMATCH[1]}
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [[ $version != "$cargo_version" ]]; then
+            echo "::error::The commit says 'Release $version' but Cargo.toml has version $cargo_version. Update Cargo.toml (and Cargo.lock) in the release commit."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "::error::Release v$version already exists."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+      - name: Install GTK
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the tests
+        run: cargo test --locked
+
+  # Debian/Ubuntu package and AppImage. Built on Ubuntu 24.04, the oldest
+  # release with a new enough GTK (4.12), so they also run on anything newer.
+  linux:
+    name: Build .deb and AppImage
+    needs: test
+    if: needs.test.outputs.version != ''
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev librsvg2-dev patchelf file wget
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Build the .deb
+        run: |
+          cargo install cargo-deb --locked
+          mkdir dist
+          cargo deb --no-build --output "dist/unlockinstaller_${VERSION}_amd64.deb"
+
+      - name: Build the AppImage
+        run: packaging/build-appimage.sh "dist/UnlockInstaller-${VERSION}-x86_64.AppImage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  # Fedora package, built on the oldest supported Fedora so that it installs
+  # on that release and newer ones. Bump the image as Fedora releases retire.
+  rpm:
+    name: Build .rpm
+    needs: test
+    if: needs.test.outputs.version != ''
+    runs-on: ubuntu-24.04
+    container: fedora:43
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+    steps:
+      - name: Install build dependencies
+        run: dnf install -y git cargo gcc gcc-c++ gtk4-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Build the .rpm
+        run: |
+          cargo install cargo-generate-rpm --locked --root /usr/local
+          mkdir dist
+          cargo generate-rpm --output "dist/unlockinstaller-${VERSION}.x86_64.rpm"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: dist/*
+          if-no-files-found: error
+
+  # Windows build, cross-compiled with MinGW and zipped with the GTK runtime.
+  # Cross-compiled builds have no rar support (see the README).
+  # Fedora 44 because the bundled GTK comes from its MinGW packages (4.21);
+  # that is the combination the bundle was tested with.
+  windows:
+    name: Build Windows .zip
+    needs: test
+    if: needs.test.outputs.version != ''
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+      PKG_CONFIG: x86_64-w64-mingw32-pkg-config
+      PKG_CONFIG_ALLOW_CROSS: "1"
+    steps:
+      - name: Install build dependencies
+        run: >
+          dnf install -y git cargo rust-std-static-x86_64-pc-windows-gnu
+          mingw64-gcc mingw64-gtk4 mingw64-librsvg2
+          mingw64-adwaita-icon-theme mingw64-hicolor-icon-theme
+          glib2-devel zip findutils gawk
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --locked --no-default-features --target x86_64-pc-windows-gnu
+
+      - name: Bundle with the GTK runtime
+        run: |
+          mkdir dist
+          packaging/windows-bundle.sh \
+            target/x86_64-pc-windows-gnu/release/unlockinstaller.exe \
+            "dist/UnlockInstaller-${VERSION}-windows-x86_64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create the GitHub release
+    needs: [test, linux, rpm, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write the release notes
+        run: |
+          # The commits since the previous release, without the release commit itself.
+          previous=$(git describe --tags --abbrev=0 --match 'v*' HEAD 2>/dev/null || true)
+          {
+            echo "## Changes"
+            echo
+            if git rev-parse --quiet --verify HEAD^ >/dev/null; then
+              git log --no-merges --pretty='- %s (%h)' ${previous:+"$previous.."}HEAD^
+            fi
+            echo
+            echo "## Downloads"
+            echo
+            echo "- **Windows**: \`UnlockInstaller-${VERSION}-windows-x86_64.zip\` (unzip and run \`unlockinstaller.exe\`)"
+            echo "- **Fedora**: \`unlockinstaller-${VERSION}.x86_64.rpm\`"
+            echo "- **Debian / Ubuntu**: \`unlockinstaller_${VERSION}_amd64.deb\`"
+            echo "- **Other Linux**: \`UnlockInstaller-${VERSION}-x86_64.AppImage\`"
+          } > notes.md
+          cat notes.md
+
+      - name: Create the release
+        run: |
+          ls -l dist
+          gh release create "v$VERSION" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "UnlockInstaller $VERSION" \
+            --notes-file notes.md
+
+  # dnf and apt repositories on GitHub Pages, rebuilt from the packages of the
+  # most recent releases. Needs Pages set to "GitHub Actions" and the
+  # REPO_GPG_PRIVATE_KEY secret (see the README).
+  repos:
+    name: Publish the dnf and apt repositories
+    needs: [test, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # How many releases to keep installable from the repositories.
+      KEEP_RELEASES: "5"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import the signing key
+        id: key
+        env:
+          REPO_GPG_PRIVATE_KEY: ${{ secrets.REPO_GPG_PRIVATE_KEY }}
+        run: |
+          if [[ -z $REPO_GPG_PRIVATE_KEY ]]; then
+            echo "::error::The REPO_GPG_PRIVATE_KEY secret is not set, so the repositories cannot be signed. See 'Releasing' in the README."
+            exit 1
+          fi
+          printf '%s\n' "$REPO_GPG_PRIVATE_KEY" | gpg --batch --import
+          id=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Install the repository tools
+        run: sudo apt-get update && sudo apt-get install -y createrepo-c dpkg-dev apt-utils
+
+      - name: Download the packages of the latest releases
+        run: |
+          mkdir -p site/rpm site/apt
+          for tag in $(gh release list --limit "$KEEP_RELEASES" --exclude-drafts --json tagName --jq '.[].tagName'); do
+            gh release download "$tag" --pattern '*.rpm' --dir site/rpm || true
+            gh release download "$tag" --pattern '*.deb' --dir site/apt || true
+          done
+          ls -l site/rpm site/apt
+
+      - uses: actions/configure-pages@v5
+        id: pages
+
+      - name: Build and sign the repositories
+        run: packaging/build-repos.sh site "${{ steps.pages.outputs.base_url }}" "${{ steps.key.outputs.id }}"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        id: deploy

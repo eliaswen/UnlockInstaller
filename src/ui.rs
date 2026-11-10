@@ -237,6 +237,8 @@ struct App {
     rescan_btn: gtk::Button,
     uninstall_all: gio::SimpleAction,
     banner: gtk::Box,
+    update_banner: gtk::Box,
+    update_label: gtk::Label,
     no_games: gtk::Label,
     settings: RefCell<Settings>,
     settings_ui: RefCell<Option<SettingsUi>>,
@@ -290,6 +292,7 @@ impl App {
         let menu = gio::Menu::new();
         menu.append(Some("Settings"), Some("win.settings"));
         menu.append(Some("Uninstall from all games…"), Some("win.uninstall-all"));
+        menu.append(Some("Check for updates"), Some("win.check-updates"));
         menu.append(Some(&format!("About {APP_NAME}")), Some("win.about"));
         let menu_btn = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -302,7 +305,8 @@ impl App {
         let uninstall_all = gio::SimpleAction::new("uninstall-all", None);
         let settings_action = gio::SimpleAction::new("settings", None);
         let about_action = gio::SimpleAction::new("about", None);
-        for a in [&uninstall_all, &settings_action, &about_action] {
+        let updates_action = gio::SimpleAction::new("check-updates", None);
+        for a in [&uninstall_all, &settings_action, &about_action, &updates_action] {
             window.add_action(a);
         }
 
@@ -317,6 +321,23 @@ impl App {
         banner_btn.set_valign(gtk::Align::Center);
         banner.append(&banner_text);
         banner.append(&banner_btn);
+
+        // --- "update available" banner --------------------------------------
+        let update_banner = hbox(12);
+        update_banner.add_css_class("banner");
+        update_banner.set_visible(false);
+        let update_label = label("");
+        update_label.set_hexpand(true);
+        update_label.set_wrap(true);
+        let update_link = gtk::LinkButton::with_label(&github::app_release_url(), "View release");
+        update_link.set_valign(gtk::Align::Center);
+        let update_dismiss = gtk::Button::with_label("Dismiss");
+        update_dismiss.set_valign(gtk::Align::Center);
+        update_banner.append(&update_label);
+        update_banner.append(&update_link);
+        update_banner.append(&update_dismiss);
+        let b = update_banner.clone();
+        update_dismiss.connect_clicked(move |_| b.set_visible(false));
 
         // --- game list (left) ----------------------------------------------
         let search = gtk::SearchEntry::new();
@@ -474,6 +495,7 @@ impl App {
         status.set_margin_bottom(6);
 
         let root = vbox(0);
+        root.append(&update_banner);
         root.append(&banner);
         root.append(&paned);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -486,6 +508,8 @@ impl App {
             rescan_btn,
             uninstall_all,
             banner,
+            update_banner,
+            update_label,
             no_games,
             settings: RefCell::new(Settings::load()),
             settings_ui: RefCell::new(None),
@@ -526,6 +550,8 @@ impl App {
         settings_action.connect_activate(move |_, _| a.open_settings());
         let a = app.clone();
         about_action.connect_activate(move |_, _| a.show_about());
+        let a = app.clone();
+        updates_action.connect_activate(move |_, _| a.check_updates(true));
         let a = app.clone();
         app.search.connect_search_changed(move |_| a.refresh_games());
         let a = app.clone();
@@ -568,6 +594,9 @@ impl App {
         app.window.present();
         if wine::detected() {
             app.warn_wine();
+        }
+        if app.settings.borrow().check_updates {
+            app.check_updates(false);
         }
         app
     }
@@ -1172,6 +1201,34 @@ impl App {
         }
     }
 
+    /// Ask GitHub whether a newer release exists and, if so, show a banner
+    /// linking to it. Nothing is downloaded. `manual` checks (from the menu)
+    /// also report "up to date" and errors; the startup check stays quiet.
+    fn check_updates(self: &Rc<Self>, manual: bool) {
+        if manual {
+            self.set_status("Checking for updates…");
+        }
+        let a = self.clone();
+        run_bg(github::check_update, move |res| match res {
+            Ok(Some(version)) => {
+                a.update_label.set_text(&format!(
+                    "{APP_NAME} {version} is available (you have {}).",
+                    env!("CARGO_PKG_VERSION")
+                ));
+                a.update_banner.set_visible(true);
+                if manual {
+                    a.set_status(format!("{APP_NAME} {version} is available"));
+                }
+            }
+            Ok(None) if manual => a.set_status(format!(
+                "{APP_NAME} {} is the latest version",
+                env!("CARGO_PKG_VERSION")
+            )),
+            Err(e) if manual => a.set_status(format!("Update check failed: {e}")),
+            _ => {}
+        });
+    }
+
     /// Shown when the Windows build is started under Wine or Proton.
     fn warn_wine(self: &Rc<Self>) {
         let dialog = gtk::AlertDialog::builder()
@@ -1286,6 +1343,18 @@ impl App {
             &[method_dd.upcast_ref()],
         ));
 
+        let updates_switch = gtk::Switch::new();
+        updates_switch.set_active(self.settings.borrow().check_updates);
+        let a = self.clone();
+        updates_switch.connect_active_notify(move |sw| {
+            a.change_settings(|s| s.check_updates = sw.is_active());
+        });
+        defaults.append(&setting_row(
+            "Check for updates on startup",
+            Some(&label("Shows a link to the new release; nothing is downloaded")),
+            &[updates_switch.upcast_ref()],
+        ));
+
         // --- folders ---
         let (folders_frame, folders_list) = boxed_list();
         let mut folders = Vec::new();
@@ -1344,7 +1413,7 @@ impl App {
         body.append(&section_title("Unlockers"));
         body.append(&unlockers_frame);
         body.append(&unlockers_note);
-        let defaults_title = section_title("Defaults");
+        let defaults_title = section_title("General");
         defaults_title.set_margin_top(12);
         body.append(&defaults_title);
         body.append(&defaults_frame);

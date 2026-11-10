@@ -23,11 +23,19 @@ pub struct Settings {
     pub data_dir: Option<PathBuf>,
     /// Folder for the DLC cache and downloads; `None` for the default.
     pub cache_dir: Option<PathBuf>,
+    /// Look for a newer release on GitHub when the app starts.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { unlocker: Kind::SmokeApi, method: Method::Direct, data_dir: None, cache_dir: None }
+        Settings {
+            unlocker: Kind::SmokeApi,
+            method: Method::Direct,
+            data_dir: None,
+            cache_dir: None,
+            check_updates: true,
+        }
     }
 }
 
@@ -109,6 +117,7 @@ mod backend {
     const METHOD: &str = "Method";
     const DATA_DIR: &str = "ExtractPath";
     const CACHE_DIR: &str = "CachePath";
+    const CHECK_UPDATES: &str = "CheckUpdates";
 
     pub fn location() -> String {
         format!(r"the registry (HKEY_CURRENT_USER\{KEY})")
@@ -139,6 +148,9 @@ mod backend {
         }
         s.data_dir = get(DATA_DIR).map(PathBuf::from);
         s.cache_dir = get(CACHE_DIR).map(PathBuf::from);
+        if let Ok(v) = key.get_value::<u32, _>(CHECK_UPDATES) {
+            s.check_updates = v != 0;
+        }
         s
     }
 
@@ -147,6 +159,7 @@ mod backend {
         let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY).map_err(err)?;
         key.set_value(UNLOCKER, &s.unlocker.name()).map_err(err)?;
         key.set_value(METHOD, &method_name(s.method)).map_err(err)?;
+        key.set_value(CHECK_UPDATES, &(s.check_updates as u32)).map_err(err)?;
         for (name, dir) in [(DATA_DIR, &s.data_dir), (CACHE_DIR, &s.cache_dir)] {
             match dir {
                 Some(d) => key.set_value(name, &d.as_os_str()).map_err(err)?,
@@ -184,6 +197,7 @@ mod tests {
             method: Method::Koaloader,
             data_dir: Some(std::env::temp_dir().join("ui-extract")),
             cache_dir: None,
+            check_updates: false,
         };
         custom.save().unwrap();
         assert_eq!(backend::load(), custom);
