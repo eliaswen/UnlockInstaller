@@ -1,6 +1,6 @@
 [package]
 name = "unlockinstaller"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Installs SmokeAPI and CreamAPI DLC unlockers into Steam games"
 authors = ["Elias Wendland <193786789+eliaswen@users.noreply.github.com>"]
