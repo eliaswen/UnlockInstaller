@@ -3,10 +3,10 @@
 #
 #   packaging/build-repos.sh <site-dir> <base-url> <gpg-key-id>
 #
-# Expects the packages in <site-dir>/rpm/*.rpm and <site-dir>/apt/*.deb and
-# the signing key in the current GnuPG keyring. <base-url> is where
-# <site-dir> will be served from. Needs: createrepo_c, dpkg-scanpackages,
-# apt-ftparchive, gpg.
+# Expects the packages in <site-dir>/rpm/<fedora>/*.rpm (one folder per Fedora
+# release, e.g. rpm/43 and rpm/44) and <site-dir>/apt/*.deb and the signing key
+# in the current GnuPG keyring. <base-url> is where <site-dir> will be served
+# from. Needs: createrepo_c, dpkg-scanpackages, apt-ftparchive, gpg.
 set -euo pipefail
 
 site=$(realpath "$1")
@@ -19,12 +19,17 @@ gpg --batch --yes --armor --export "$key" > "$site/key.asc"
 gpg --batch --yes --export "$key" > "$site/key.gpg"
 
 # --- dnf --------------------------------------------------------------------
-createrepo_c --quiet "$site/rpm"
-"${sign[@]}" --detach-sign --armor --output "$site/rpm/repodata/repomd.xml.asc" "$site/rpm/repodata/repomd.xml"
+# One repository per Fedora release: each package is built against that
+# release's Qt, so the releases must not share a repository.
+for repo in "$site"/rpm/*/; do
+    createrepo_c --quiet "$repo"
+    "${sign[@]}" --detach-sign --armor --output "$repo/repodata/repomd.xml.asc" "$repo/repodata/repomd.xml"
+done
+# dnf fills in $releasever with the Fedora release, so one .repo file serves both.
 cat > "$site/rpm/unlockinstaller.repo" <<REPO
 [unlockinstaller]
 name=UnlockInstaller
-baseurl=$base/rpm
+baseurl=$base/rpm/\$releasever
 enabled=1
 # The repository metadata is signed (and lists each package's checksum);
 # the packages themselves are not.

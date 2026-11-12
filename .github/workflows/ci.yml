@@ -103,14 +103,20 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Fedora package, built on the oldest supported Fedora so that it installs
-  # on that release and newer ones. Bump the image as Fedora releases retire.
+  # Fedora packages, one per release. Each is built in its own Fedora container
+  # so it links the Qt of that release: Qt's private API changes between
+  # releases, so a package built on one release fails to start on the next.
+  # Add a release to the matrix when Fedora releases it.
   rpm:
-    name: Build .rpm
+    name: Build .rpm for Fedora ${{ matrix.fedora }}
     needs: test
     if: needs.test.outputs.version != ''
     runs-on: ubuntu-24.04
-    container: fedora:43
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora: ["43", "44"]
+    container: fedora:${{ matrix.fedora }}
     env:
       VERSION: ${{ needs.test.outputs.version }}
     steps:
@@ -123,14 +129,17 @@ jobs:
         run: cargo build --release --locked
 
       - name: Build the .rpm
+        # The release tag (fc43, fc44) keeps the packages for each Fedora apart.
         run: |
           cargo install cargo-generate-rpm --locked --root /usr/local
           mkdir dist
-          cargo generate-rpm --output "dist/unlockinstaller-${VERSION}.x86_64.rpm"
+          cargo generate-rpm \
+            --set-metadata 'release = "1.fc${{ matrix.fedora }}"' \
+            --output "dist/unlockinstaller-${VERSION}-1.fc${{ matrix.fedora }}.x86_64.rpm"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: rpm
+          name: rpm-fedora-${{ matrix.fedora }}
           path: dist/*
           if-no-files-found: error
 
@@ -205,7 +214,8 @@ jobs:
             echo "## Downloads"
             echo
             echo "- **Windows**: \`UnlockInstaller-${VERSION}-windows-x86_64.zip\` (unzip and run \`unlockinstaller.exe\`)"
-            echo "- **Fedora**: \`unlockinstaller-${VERSION}.x86_64.rpm\`"
+            echo "- **Fedora 44**: \`unlockinstaller-${VERSION}-1.fc44.x86_64.rpm\`"
+            echo "- **Fedora 43**: \`unlockinstaller-${VERSION}-1.fc43.x86_64.rpm\`"
             echo "- **Debian / Ubuntu**: \`unlockinstaller_${VERSION}_amd64.deb\`"
             echo "- **Other Linux**: \`UnlockInstaller-${VERSION}-x86_64.AppImage\`"
           } > notes.md
@@ -261,12 +271,22 @@ jobs:
 
       - name: Download the packages of the latest releases
         run: |
-          mkdir -p site/rpm site/apt
+          mkdir -p site/incoming site/rpm/43 site/rpm/44 site/apt
           for tag in $(gh release list --limit "$KEEP_RELEASES" --exclude-drafts --json tagName --jq '.[].tagName'); do
-            gh release download "$tag" --pattern '*.rpm' --dir site/rpm || true
+            gh release download "$tag" --pattern '*.rpm' --dir site/incoming || true
             gh release download "$tag" --pattern '*.deb' --dir site/apt || true
           done
-          ls -l site/rpm site/apt
+          # Sort the packages by Fedora release. Packages from before the split
+          # have no fcNN tag and were built on Fedora 43.
+          for f in site/incoming/*.rpm; do
+            [ -e "$f" ] || continue
+            case $f in
+              *.fc44.*) mv "$f" site/rpm/44/ ;;
+              *) mv "$f" site/rpm/43/ ;;
+            esac
+          done
+          rmdir site/incoming
+          ls -l site/rpm/43 site/rpm/44 site/apt
 
       - uses: actions/configure-pages@v5
         id: pages
